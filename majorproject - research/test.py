@@ -1,134 +1,99 @@
 import cv2
 import numpy as np
-import mediapipe as mp
+import tensorflow as tf
 
-def overlay_transparent(background, overlay, x, y):
-    """
-    Overlays a transparent PNG onto another image using CV2.
-    :param background: The background image (OpenCV image).
-    :param overlay: The transparent image to overlay (with alpha channel).
-    :param x: The x-coordinate where the overlay is placed.
-    :param y: The y-coordinate where the overlay is placed.
-    """
-    # Get dimensions
-    h_bg, w_bg = background.shape[:2]
-    h_ol, w_ol = overlay.shape[:2]
+# Load the TFLite hair segmentation model
+interpreter = tf.lite.Interpreter(model_path="hair_segmenter.tflite")
+interpreter.allocate_tensors()
 
-    # Ensure the overlay is within the frame boundaries
-    if x >= w_bg or y >= h_bg:
-        return
+# Get input and output tensor details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
-    # Clip the overlay if it goes beyond the background dimensions
-    overlay = overlay[max(0, -y):min(h_ol, h_bg - y), max(0, -x):min(w_ol, w_bg - x)]
-    h_ol, w_ol = overlay.shape[:2]
+# Print model's expected input details
+input_shape = input_details[0]['shape']
+print("Model's expected input shape:", input_shape)
+print("Model's expected input dtype:", input_details[0]['dtype'])
 
-    if h_ol <= 0 or w_ol <= 0:
-        return
+# Open the default webcam
+cap = cv2.VideoCapture(1)
 
-    # Adjust x and y if they are negative
-    x = max(x, 0)
-    y = max(y, 0)
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-    # Split the overlay image into BGR and Alpha channels
-    if overlay.shape[2] == 4:
-        overlay_img = overlay[:, :, :3]
-        mask = overlay[:, :, 3:] / 255.0
+    # Preprocess the frame
+    input_height, input_width = input_shape[1], input_shape[2]
+
+    resized_frame = cv2.resize(frame, (input_width, input_height))
+
+    # Convert BGR to RGBA
+    input_data = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGBA)
+
+    # Expand dimensions to match the model's input shape
+    input_data = np.expand_dims(input_data, axis=0)
+
+    # Normalize pixel values if required
+    input_data = input_data.astype(np.float32) / 255.0
+
+    # Verify the input data shape
+    print("Input data shape:", input_data.shape)
+
+    # Set the tensor to the input data
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+
+    # Run inference
+    interpreter.invoke()
+
+    # Get the results
+    output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+
+    # Debugging: Check output data shape and type
+    print("Output data shape:", output_data.shape, "dtype:", output_data.dtype)
+
+    # Process the output_data to create a mask
+    # Modify based on your model's output format
+    if output_data.ndim == 3 and output_data.shape[-1] > 1:
+        # Multi-class segmentation
+        class_map = np.argmax(output_data, axis=-1).astype(np.uint8)
+        # Replace 'hair_class_index' with the correct index for hair
+        hair_class_index = 1  # Example index
+        hair_mask = (class_map == hair_class_index).astype(np.uint8) * 255
     else:
-        overlay_img = overlay
-        mask = np.ones((h_ol, w_ol, 1), dtype=np.float32)
+        # Binary segmentation
+        hair_mask = output_data.squeeze() > 0.5  # Adjust threshold if needed
+        hair_mask = hair_mask.astype(np.uint8) * 255
 
-    # Extract the region of interest from the background
-    roi = background[y:y+h_ol, x:x+w_ol]
+    # Resize the mask to match the frame size
+    hair_mask = cv2.resize(hair_mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-    # Blend the overlay with the ROI
-    roi = (1.0 - mask) * roi + mask * overlay_img
+    # Apply the mask to the frame
+    hair_mask_3d = cv2.merge([hair_mask, hair_mask, hair_mask])
 
-    # Put the blended ROI back into the frame
-    background[y:y+h_ol, x:x+w_ol] = roi
+    # Verify shapes and data types
+    print("Frame shape:", frame.shape, "dtype:", frame.dtype)
+    print("Hair mask 3D shape:", hair_mask_3d.shape, "dtype:", hair_mask_3d.dtype)
 
-def main():
-    # Initialize Mediapipe Face Mesh
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False,
-                                      max_num_faces=1,
-                                      refine_landmarks=True,
-                                      min_detection_confidence=0.5,
-                                      min_tracking_confidence=0.5)
+    # Ensure data types match
+    frame = frame.astype(np.uint8)
+    hair_mask_3d = hair_mask_3d.astype(np.uint8)
 
-    # Load the hairstyle image with alpha channel
-    hairstyle = cv2.imread('extracted_hairstyle.png', cv2.IMREAD_UNCHANGED)
-    if hairstyle is None:
-        print("Error: Hairstyle image not found.")
-        return
+    # Perform bitwise AND operation
+    hair_region = cv2.bitwise_and(frame, hair_mask_3d)
 
-    # Start video capture
-    cap = cv2.VideoCapture(1)
+    # Optionally, change hair color
+    hair_region[hair_mask == 255] = [255, 0, 0]  # Blue color in BGR
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Combine hair region with the original frame
+    output_frame = np.where(hair_mask_3d == 255, hair_region, frame)
 
-        # Flip the frame horizontally for a mirror-like effect
-        frame = cv2.flip(frame, 1)
-        img_h, img_w = frame.shape[:2]
+    # Display the result
+    cv2.imshow('Real-time Hair Segmentation', output_frame)
 
-        # Convert the BGR image to RGB before processing
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-        # Process the image and find face landmarks
-        results = face_mesh.process(frame_rgb)
-
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                landmarks = face_landmarks.landmark
-
-                # Convert landmarks to pixel coordinates
-                landmark_points = np.array([(lm.x * img_w, lm.y * img_h) for lm in landmarks])
-
-                # Indices for the top of the forehead and chin
-                forehead_idx = 10  # Top of forehead
-                chin_idx = 152     # Chin
-
-                # Get the coordinates
-                forehead_point = landmark_points[forehead_idx]
-                chin_point = landmark_points[chin_idx]
-
-                # Calculate face height
-                face_height = np.linalg.norm(forehead_point - chin_point)
-
-                # Estimate the width of the face
-                left_cheek_idx = 234
-                right_cheek_idx = 454
-                left_cheek_point = landmark_points[left_cheek_idx]
-                right_cheek_point = landmark_points[right_cheek_idx]
-                face_width = np.linalg.norm(left_cheek_point - right_cheek_point)
-
-                # Set the size for the hairstyle overlay
-                overlay_height = int(face_height * 1.5)  # Adjust multiplier as needed
-                overlay_width = int(face_width * 1.2)    # Adjust multiplier as needed
-                overlay_size = (overlay_width, overlay_height)
-
-                # Calculate the position to place the overlay
-                x = int(forehead_point[0] - overlay_width / 2)
-                y = int(forehead_point[1] - overlay_height * 0.8)  # Adjust as needed
-
-                # Resize the hairstyle image
-                resized_hairstyle = cv2.resize(hairstyle, overlay_size, interpolation=cv2.INTER_AREA)
-
-                # Overlay the hairstyle
-                overlay_transparent(frame, resized_hairstyle, x, y)
-
-        # Display the result
-        cv2.imshow('Hairstyle Overlay', frame)
-
-        # Break the loop on 'q' key press
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    # Release resources
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == '__main__':
-    main()
+# Cleanup
+cap.release()
+cv2.destroyAllWindows()
